@@ -25,6 +25,24 @@ func home(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 }
 
+// refusedSignIn comes back from the sign-in page as the browser would and
+// says the sign-in failed with want in its reason: the code was not traded
+// for tokens. It returns what the page said.
+func refusedSignIn(t *testing.T, st mcpauth.State, want string) string {
+	t.Helper()
+	resp, err := http.Get(st.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got, _ := mcpauth.Progress(st.ID)
+	if got.State != "failed" || !strings.Contains(got.Error, want) {
+		t.Fatalf("sign-in %s: %s (%s)", got.State, got.Error, b)
+	}
+	return string(b)
+}
+
 // Signing in finds the authorization server from the server's 401 (its
 // resource metadata, then the server's metadata), registers magpie as a
 // client sent back to a loopback address, and trades the code for tokens
@@ -84,6 +102,85 @@ func TestSignInWithoutMetadata(t *testing.T) {
 	r, _ := mcpauth.Get("old")
 	if r.TokenURL != f.Server.URL+"/token" {
 		t.Errorf("token endpoint %s", r.TokenURL)
+	}
+}
+
+// RFC 9207: the sign-in's answer names the issuer it came from, and a name
+// that isn't the one discovery found is refused before the code is traded:
+// a mix-up attack otherwise has magpie exchange a code another
+// authorization server gave out (unravel11, #7123).
+func TestSignInRefusesAnotherIssuer(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.Iss = "https://another.example/oauth"
+	st, err := mcpauth.Start(t.Context(), "neon", f.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedSignIn(t, st, "names another issuer")
+	if f.Exchanged != 0 {
+		t.Error("the code was traded with another issuer's name")
+	}
+}
+
+// A server whose metadata says its answers name the issuer
+// (authorization_response_iss_parameter_supported) and then leaves the name
+// out gets no trade either: the absence is the mix-up the metadata promised
+// wouldn't happen.
+func TestSignInRefusesAnIssuerLeftOut(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.IssSupported = true
+	st, err := mcpauth.Start(t.Context(), "neon", f.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedSignIn(t, st, "doesn't name its issuer")
+	if f.Exchanged != 0 {
+		t.Error("the code was traded without the issuer the server said it would name")
+	}
+}
+
+// A refusal still reaches the page when its answer names the issuer
+// discovery found: the name was there to compare, and it matched.
+func TestSignInShowsARefusal(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.Refuse = "access_denied"
+	st, err := mcpauth.Start(t.Context(), "neon", f.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedSignIn(t, st, "the sign-in was refused (access_denied)")
+}
+
+// An error answer from another issuer is refused before its text is shown:
+// RFC 9207 has the client neither act on nor display a mismatched answer's
+// error, error_description or error_uri.
+func TestSignInHidesARefusalFromAnotherIssuer(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.Iss, f.Refuse = "https://another.example/oauth", "access_denied"
+	st, err := mcpauth.Start(t.Context(), "neon", f.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := refusedSignIn(t, st, "names another issuer")
+	if strings.Contains(b, "access_denied") {
+		t.Errorf("another issuer's error text was shown: %s", b)
+	}
+}
+
+// The answer that names the issuer discovery found signs in as always, and
+// says so in its metadata: the name is there, so its absence isn't what's
+// looked for.
+func TestSignInTakesItsOwnIssuer(t *testing.T) {
+	home(t)
+	f := mcpauthtest.New(t)
+	f.Iss, f.IssSupported = f.Server.URL+"/oauth", true
+	f.SignIn(t, "neon")
+	if f.Exchanged != 1 {
+		t.Fatal("no code exchange")
 	}
 }
 

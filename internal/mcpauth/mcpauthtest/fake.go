@@ -65,6 +65,17 @@ type Fake struct {
 	// registration response lets it: the token endpoint takes it as
 	// registered
 	Assign string
+	// Iss is the issuer the sign-in's answer names (RFC 9207's iss), left
+	// out when empty, as an authorization server that doesn't send one
+	// answers
+	Iss string
+	// IssSupported is whether the metadata says the answer names its issuer
+	// (authorization_response_iss_parameter_supported)
+	IssSupported bool
+	// Refuse is the error the sign-in's answer names instead of a code, as a
+	// user who declined gives access_denied: an error answer names the
+	// issuer too (RFC 9207 Section 2)
+	Refuse string
 
 	refuse  bool // RefuseTokens
 	codes   map[string]codeGrant
@@ -111,6 +122,9 @@ func New(t *testing.T) *Fake {
 		}
 		if f.NoRegistration {
 			delete(m, "registration_endpoint")
+		}
+		if f.IssSupported {
+			m["authorization_response_iss_parameter_supported"] = true
 		}
 		if f.OpenID {
 			m["scopes_supported"] = []string{"openid", "email", "offline_access", "profile"}
@@ -181,12 +195,21 @@ func New(t *testing.T) *Fake {
 		f.mu.Lock()
 		f.n++
 		code := fmt.Sprintf("code-%d", f.n)
-		f.codes[code] = codeGrant{q.Get("code_challenge"), q.Get("client_id"), q.Get("redirect_uri"), q.Get("resource"), q.Get("scope")}
+		if f.Refuse == "" {
+			f.codes[code] = codeGrant{q.Get("code_challenge"), q.Get("client_id"), q.Get("redirect_uri"), q.Get("resource"), q.Get("scope")}
+		}
 		f.mu.Unlock()
 		back, _ := url.Parse(q.Get("redirect_uri"))
 		bq := back.Query()
-		bq.Set("code", code)
 		bq.Set("state", q.Get("state"))
+		if f.Iss != "" {
+			bq.Set("iss", f.Iss)
+		}
+		if f.Refuse != "" {
+			bq.Set("error", f.Refuse)
+		} else {
+			bq.Set("code", code)
+		}
 		back.RawQuery = bq.Encode()
 		http.Redirect(w, r, back.String(), http.StatusFound)
 	}

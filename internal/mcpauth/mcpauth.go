@@ -666,6 +666,9 @@ type meta struct {
 	RegisterURL  string
 	Scope        string
 	AuthMethods  []string // token_endpoint_auth_methods_supported
+	// IssSupported is whether the authorization server says its answers
+	// name the issuer (RFC 9207's authorization_response_iss_parameter_supported)
+	IssSupported bool
 }
 
 func origin(u *url.URL) string { return u.Scheme + "://" + u.Host }
@@ -837,6 +840,7 @@ func discover(ctx context.Context, serverURL string) (meta, error) {
 		Challenges    []string `json:"code_challenge_methods_supported"`
 		AuthMethods   []string `json:"token_endpoint_auth_methods_supported"`
 		ScopesSupport []string `json:"scopes_supported"`
+		IssParam      bool     `json:"authorization_response_iss_parameter_supported"`
 	}
 	iu, err := url.Parse(issuer)
 	if err != nil || iu.Host == "" {
@@ -862,6 +866,13 @@ func discover(ctx context.Context, serverURL string) (meta, error) {
 			return meta{}, errors.New("the server's sign-in doesn't offer PKCE (S256), which magpie needs")
 		}
 		m.Issuer, m.AuthorizeURL, m.TokenURL, m.RegisterURL, m.AuthMethods = as.Issuer, as.Authorize, as.Token, as.Register, as.AuthMethods
+		m.IssSupported = as.IssParam
+		if m.Issuer == "" {
+			// RFC 8414 requires the issuer, and RFC 9207 compares the
+			// answer's name with it: a server that leaves it out is still
+			// the one whose metadata this was found at
+			m.Issuer = issuer
+		}
 		m.Scope = withOffline(m.Scope, as.ScopesSupport)
 	case !found:
 		// the older spec: the server's origin is its authorization server,
@@ -1165,6 +1176,26 @@ func start(ctx context.Context, name, serverURL string, app *App, add *string) (
 		}
 		f.claimed = true
 		f.mu.Unlock()
+		// RFC 9207: the answer names the issuer it came from, and it is the
+		// one discovery found, compared exactly, with no case, port, slash
+		// or encoding folded away. It is looked at before the answer's
+		// error: an answer that names another server, or that leaves the
+		// name out though the server's metadata said its answers carry one,
+		// gets neither the code traded nor its error text shown, as a
+		// mix-up attack needs one or the other to land
+		iss := v.Get("iss")
+		if iss != "" && iss != m.Issuer {
+			msg := "the sign-in's answer names another issuer (" + iss + ")"
+			f.finish(State{State: "failed", Error: msg})
+			page(w, http.StatusOK, "Magpie couldn't finish the sign-in: "+msg)
+			return
+		}
+		if iss == "" && m.IssSupported {
+			msg := "the sign-in's answer doesn't name its issuer, though the server said it would"
+			f.finish(State{State: "failed", Error: msg})
+			page(w, http.StatusOK, "Magpie couldn't finish the sign-in: "+msg)
+			return
+		}
 		if e := v.Get("error"); e != "" {
 			msg := e
 			if d := v.Get("error_description"); d != "" {
