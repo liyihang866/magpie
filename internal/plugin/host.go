@@ -16,6 +16,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -612,8 +613,9 @@ type ctrl struct {
 // writeReq is one message for the writer: its result goes to done, when the
 // sender needs it (a control abort, whose slot comes back once it is written).
 type writeReq struct {
-	b    []byte
-	done chan error
+	b     []byte
+	done  chan error
+	after func(error) // once the write is done, with its error
 }
 
 // Loaded is how a plugin fared when the host loaded it.
@@ -1524,7 +1526,7 @@ func (h *host) enqueueOwned(ctx context.Context, v any, done chan error, c *call
 	if err != nil {
 		return err
 	}
-	return h.enqueueLine(ctx, append(b, '\n'), done, c, state)
+	return h.enqueueLine(ctx, append(b, '\n'), done, nil, c, state)
 }
 
 // fetchLine is Fetch's call id for r, as the line the host reads, byte
@@ -1555,8 +1557,8 @@ func fetchLine(id int64, r FetchRequest) ([]byte, error) {
 }
 
 // enqueueLine is enqueueOwned for a call already a line.
-func (h *host) enqueueLine(ctx context.Context, line []byte, done chan error, c *call, state callState) error {
-	req := writeReq{b: line, done: done}
+func (h *host) enqueueLine(ctx context.Context, line []byte, done chan error, after func(error), c *call, state callState) error {
+	req := writeReq{b: line, done: done, after: after}
 	for {
 		h.mu.Lock()
 		if !h.alive() {
@@ -1618,12 +1620,18 @@ func (h *host) writerLoop() {
 		case req := <-h.out:
 			h.tookWrite()
 			if !h.alive() {
+				if req.after != nil {
+					req.after(errHostGone)
+				}
 				if req.done != nil {
 					req.done <- errHostGone
 				}
 				return
 			}
 			_, err := h.in.Write(req.b)
+			if req.after != nil {
+				req.after(err)
+			}
 			if err != nil {
 				// End the host before the writer's caller hears of it, so a
 				// caller freed by the failure finds the host already dead.
@@ -2149,7 +2157,18 @@ func Fetch(ctx context.Context, r FetchRequest) (*http.Response, error) {
 		return nil, err
 	}
 	c.watchCtx(ctx)
-	err = h.enqueueLine(ctx, line, nil, c, callSending)
+	tr := httptrace.ContextClientTrace(ctx)
+	// A plugin's fetch writes no HTTP request: the host writes the frame
+	// to the child. Say the request went out once the writer wrote it, as an
+	// http.Transport does, so a caller's per-try limit starts when the frame
+	// is written, not while it waits in the host's queue, and not only the
+	// whole wait.
+	after := func(err error) {
+		if err == nil && tr != nil && tr.WroteRequest != nil {
+			tr.WroteRequest(httptrace.WroteRequestInfo{})
+		}
+	}
+	err = h.enqueueLine(ctx, line, nil, after, c, callSending)
 	if err != nil {
 		c.settle(err)
 		return nil, err

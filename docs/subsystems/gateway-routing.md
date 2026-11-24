@@ -2143,7 +2143,12 @@ Covered by `TestCommandCodeSearchesForOtherModels`,
 ## A searcher that fails or finds nothing
 
 `modelSearch` asks the searcher picked in Settings (or the one magpie picks)
-first. `searchWith` tells three outcomes apart: an error, a reply that
+first. A search's own try is given `searchTimeout` (2m) from when its
+request goes out, within `searchWaitMost` (5m) all told; a plugin
+searcher's fetch says its frame is written, so that limit starts there as
+an HTTP provider's does. A try that runs out ends the search: the next
+searcher is not asked (the side context is shared). `searchWith` tells
+three outcomes apart: an error, a reply that
 searched and named no page (`errFoundNothing`), and a reply with no search
 in it at all, no `server_tool_use` or `web_search_tool_result`
 (`errNotSearched`, which is found nothing too). The last is a vendor that
@@ -2736,7 +2741,16 @@ as `AutoVision` ranks them (`seersRanked`, the ranking `autoVision` takes
 its first from), passing over the models already asked and any that
 turned an image away (`sightRefused`). Up to `visionTries` (3) models are
 asked, within `visionWaitMost` all told (each try is given what is left,
-`askVisionWith`'s `most`). A model out of its allowance is not asked in
+`askVisionWith`'s `most`). A try's own `visionTimeout` starts when its
+request goes out: an HTTP provider's write, or a plugin's frame written to
+its host by [`plugin.Fetch`](../../internal/plugin/host.go), which says so
+to the client trace as an HTTP write is (see [provider and plugin
+ownership](provider-plugins.md)), so a description asked of a plugin
+provider is cut at that limit. The next model that sees may be asked for
+another try when one fails or runs out its own time, so a description can
+still take more than one try. A Claude account's description has no such
+write: its bridge runs a CLI, and only the whole wait bounds it until the
+bridge reports its run. A model out of its allowance is not asked in
 another's place: `seersRanked` puts those last, so the first being out
 means every one is. A request whose context ended (the agent canceled it)
 asks no other.
@@ -2786,7 +2800,9 @@ Covered by `TestPickedDescriberThatFailsGivesWayToTheNextThatSees`,
 `TestNoDescriberAnswersNamesEach`,
 `TestPickedDescriberThatAnswersIsTheOnlyOneAsked`,
 `TestCanceledDescriptionAsksNoOther`
-([`vision_fallback_test.go`](../../internal/gateway/vision_fallback_test.go))
+([`vision_fallback_test.go`](../../internal/gateway/vision_fallback_test.go)),
+`TestPluginDescriberKeepsItsTryLimit`
+([`vision_plugin_wait_test.go`](../../internal/gateway/vision_plugin_wait_test.go))
 and `vision-instead.test.cjs`.
 
 ## A description is no one request's

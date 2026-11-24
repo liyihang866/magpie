@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptrace"
 	"os/exec"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 // This file is the wire contract of Fetch's request encoding: the body reaches
@@ -25,6 +28,7 @@ import (
 // frame left unanswered would park the production Fetch).
 type wireIn struct {
 	keep  bool
+	gate  chan struct{} // a fetch frame's write waits for it, when not nil
 	wrote chan struct{} // buffered 1: one frame, taken by the driver
 	mu    sync.Mutex
 	lines [][]byte
@@ -42,6 +46,9 @@ func (c *wireIn) Write(p []byte) (int, error) {
 	// is dropped is left alone: answering it would move the driver's ids on
 	// from the host's own, and the next fetch would be answered as another.
 	if bytes.HasPrefix(p, []byte(`{"id":`)) && bytes.Contains(p[:min(len(p), 64)], []byte(`"method":"fetch"`)) {
+		if c.gate != nil {
+			<-c.gate
+		}
 		c.wrote <- struct{}{} // the driver is a goroutine of its own: it never holds a host lock
 	}
 	return len(p), nil
@@ -202,6 +209,54 @@ func fetchOnce(t *testing.T, r FetchRequest) []byte {
 	}
 	res.Body.Close()
 	return line
+}
+
+// A plugin's fetch is no HTTP request: the request goes to the host as a
+// frame, so the client trace's WroteRequest never fires for it unless Fetch
+// says so. sideDeadline arms a side call's per-try limit on that event, and
+// it must start once the frame is written, not while it waits in the host's
+// queue: a queued frame is no vendor's time (#2318).
+func TestFetchSaysItsRequestWentOut(t *testing.T) {
+	in := newWireIn(true)
+	in.gate = make(chan struct{})
+	h, pw := newWireHost(t, in)
+	fetchHost(t, h, pw, in, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wrote := make(chan struct{}, 1)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			select {
+			case wrote <- struct{}{}:
+			default:
+			}
+		},
+	})
+	type answer struct {
+		res *http.Response
+		err error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		res, err := Fetch(ctx, FetchRequest{Provider: "probe", Model: "eye", NPM: "@probe/eye", URL: "https://vendor.example/v1/chat/completions", Method: "POST", Body: []byte(`{}`)})
+		done <- answer{res, err}
+	}()
+	select {
+	case <-wrote:
+		t.Fatal("Fetch said its frame went out before the frame was written")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(in.gate)
+	select {
+	case <-wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Fetch never said its frame went out after the frame was written")
+	}
+	a := <-done
+	if a.err != nil {
+		t.Fatalf("Fetch: %v", a.err)
+	}
+	a.res.Body.Close()
 }
 
 // expectedFetchParams is the params struct Fetch builds: the body as the
